@@ -14,6 +14,10 @@ on:
         description: "ID composition (kosong = otomatis atau dari render.json)"
         required: false
         default: ""
+      chunks:
+        description: "Jumlah potongan render paralel per project (tiap potongan = 1 runner)"
+        required: false
+        default: "6"
 
 permissions:
   contents: write
@@ -22,7 +26,12 @@ concurrency:
   group: render-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  # Default render untuk runner public (4 vCPU, 16 GB). render.json "args" menimpa ini.
+  RENDER_DEFAULTS: "--concurrency=4 --gl=swangle --log=error"
+
 jobs:
+  # 1. Tentukan project mana yang dirender
   plan:
     runs-on: ubuntu-24.04
     outputs:
@@ -73,11 +82,12 @@ jobs:
             echo 'any=true' >> "$GITHUB_OUTPUT"
           fi
 
-  render:
+  # 2. Per project: pilih composition dan hitung total frame
+  prepare:
     needs: plan
     if: needs.plan.outputs.any == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -88,6 +98,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ matrix.project }}-${{ hashFiles(format('projects/{0}*', matrix.project), format('projects/{0}/package*.json', matrix.project)) }}
+          restore-keys: |
+            npm-${{ matrix.project }}-
 
       - name: Siapkan folder project
         env:
@@ -109,25 +127,21 @@ jobs:
             cp -r "projects/$P" "work/$P"
           fi
           test -f "work/$P/package.json" || { echo "::error::package.json tidak ditemukan di project $P"; exit 1; }
-          ls -la "work/$P"
 
-      - name: Install library sistem untuk Chrome dan ffmpeg
+      - name: Install library sistem untuk Chrome
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg libnss3 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 \
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libnss3 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 \
             libasound2t64 libxrandr2 libxkbcommon-x11-0 libxfixes3 libxcomposite1 \
             libxdamage1 libgbm-dev libcups2 libpango-1.0-0 libcairo2
 
-      - name: Install dependensi project
+      - name: Install dependensi dan browser
         working-directory: work/${{ matrix.project }}
         run: |
-          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+          if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
+          npx remotion browser ensure
 
-      - name: Siapkan browser Remotion
-        working-directory: work/${{ matrix.project }}
-        run: npx remotion browser ensure
-
-      - name: Render video
+      - name: Pilih composition dan hitung frame
         working-directory: work/${{ matrix.project }}
         env:
           P: ${{ matrix.project }}
@@ -148,8 +162,6 @@ jobs:
           fi
           [ -n "$ENTRY" ] || { echo "::error::File entry Remotion tidak ketemu. Buat render.json dengan field entry."; exit 1; }
 
-          # Remotion can print a status line (e.g. "⚡️ Cached bundle") before the IDs.
-          # The compositions command prints all IDs together on its final output line.
           COMPOSITIONS=$(npx remotion compositions "$ENTRY" --quiet | tail -n 1 | tr ' ' '\n' | grep -v '^$' || true)
           [ -n "$COMPOSITIONS" ] || { echo "::error::Composition tidak ditemukan untuk entry $ENTRY."; exit 1; }
           COMP="$COMP_INPUT"
@@ -168,26 +180,316 @@ jobs:
           fi
           [ -n "$COMP" ] || COMP=$(printf '%s\n' "$COMPOSITIONS" | head -n1)
 
-          EXTRA=$(cfg '(.args // []) | join(" ")')
-
           echo "Entry: $ENTRY | Composition: $COMP"
+          mkdir -p "$RUNNER_TEMP/meta"
+          cat > "$RUNNER_TEMP/meta.cjs" <<'METAEOF'
+          // Hitung total frame composition (termasuk calculateMetadata). Jalankan dari dalam folder project.
+          // Pakai: node meta.cjs <entry> <composition> <output.json>
+          const fs = require('fs');
+          const path = require('path');
+
+          const cwd = process.cwd();
+          function req(name) {
+            const tries = [[cwd]];
+            try {
+              tries.push([path.dirname(require.resolve('@remotion/cli/package.json', { paths: [cwd] }))]);
+            } catch {}
+            for (const paths of tries) {
+              try { return require(require.resolve(name, { paths })); } catch {}
+            }
+            throw new Error('Tidak bisa memuat ' + name);
+          }
+
+          (async () => {
+            const [entry, comp, out] = process.argv.slice(2);
+            const { bundle } = req('@remotion/bundler');
+            const { selectComposition } = req('@remotion/renderer');
+            const serveUrl = await bundle({ entryPoint: path.resolve(entry), onProgress: () => {} });
+            const c = await selectComposition({ serveUrl, id: comp, inputProps: {} });
+            const meta = { entry, comp, total: c.durationInFrames, fps: c.fps, width: c.width, height: c.height };
+            fs.writeFileSync(out, JSON.stringify(meta));
+            console.log('Meta:', JSON.stringify(meta));
+          })().catch((e) => { console.error(e); process.exit(1); });
+          METAEOF
+          node "$RUNNER_TEMP/meta.cjs" "$ENTRY" "$COMP" "$RUNNER_TEMP/meta/$P.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: meta__${{ matrix.project }}
+          path: ${{ runner.temp }}/meta/${{ matrix.project }}.json
+          retention-days: 1
+
+  # 3. Bagi total frame jadi potongan, satu potongan = satu runner
+  expand:
+    needs: [plan, prepare]
+    if: ${{ !cancelled() && needs.plan.outputs.any == 'true' }}
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.expand.outputs.matrix }}
+      any: ${{ steps.expand.outputs.any }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: meta__*
+          path: metas
+          merge-multiple: true
+
+      - name: Bagi frame
+        id: expand
+        env:
+          CHUNKS: ${{ github.event_name == 'workflow_dispatch' && inputs.chunks || '6' }}
+        run: |
+          python3 - >> "$GITHUB_OUTPUT" <<'PY'
+          import glob, json, math, os
+          n_max = max(1, int(os.environ.get("CHUNKS") or 6))
+          MIN_FRAMES = 120   # jangan bikin potongan lebih kecil dari ini, overhead install lebih mahal
+          include = []
+          for path in sorted(glob.glob("metas/*.json")):
+              project = os.path.basename(path)[:-5]
+              m = json.load(open(path))
+              total = int(m["total"])
+              n = max(1, min(n_max, total // MIN_FRAMES))
+              size = math.ceil(total / n)
+              parts = [(s, min(s + size - 1, total - 1)) for s in range(0, total, size)]
+              for i, (s, e) in enumerate(parts):
+                  include.append({
+                      "project": project, "entry": m["entry"], "comp": m["comp"],
+                      "idx": f"{i:03d}", "s": s, "e": e, "count": len(parts),
+                  })
+              print(f"{project}: {total} frame -> {len(parts)} potongan", file=__import__("sys").stderr)
+          print("matrix=" + json.dumps({"include": include}))
+          print("any=" + ("true" if include else "false"))
+          PY
+
+  # 4. Render potongan video (tanpa audio) secara paralel
+  render:
+    needs: expand
+    if: ${{ !cancelled() && needs.expand.outputs.any == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.expand.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ matrix.project }}-${{ hashFiles(format('projects/{0}*', matrix.project), format('projects/{0}/package*.json', matrix.project)) }}
+          restore-keys: |
+            npm-${{ matrix.project }}-
+
+      - name: Siapkan folder project
+        env:
+          P: ${{ matrix.project }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          if [ -f "projects/$P.zip" ]; then
+            mkdir -p work/_tmp
+            unzip -q -o "projects/$P.zip" -d work/_tmp
+            rm -rf work/_tmp/__MACOSX
+            if [ ! -f work/_tmp/package.json ] && [ "$(find work/_tmp -mindepth 1 -maxdepth 1 | wc -l)" -eq 1 ]; then
+              mv work/_tmp/* "work/$P"
+            else
+              mv work/_tmp "work/$P"
+            fi
+            rm -rf work/_tmp
+          else
+            cp -r "projects/$P" "work/$P"
+          fi
+          test -f "work/$P/package.json" || { echo "::error::package.json tidak ditemukan di project $P"; exit 1; }
+
+      - name: Install library sistem untuk Chrome
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libnss3 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 \
+            libasound2t64 libxrandr2 libxkbcommon-x11-0 libxfixes3 libxcomposite1 \
+            libxdamage1 libgbm-dev libcups2 libpango-1.0-0 libcairo2
+
+      - name: Install dependensi dan browser
+        working-directory: work/${{ matrix.project }}
+        run: |
+          if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
+          npx remotion browser ensure
+
+      - name: Render potongan ${{ matrix.idx }} (frame ${{ matrix.s }}-${{ matrix.e }})
+        working-directory: work/${{ matrix.project }}
+        env:
+          ENTRY: ${{ matrix.entry }}
+          COMP: ${{ matrix.comp }}
+          IDX: ${{ matrix.idx }}
+        run: |
+          set -euo pipefail
+          EXTRA=""
+          if [ -f render.json ]; then EXTRA=$(jq -r '(.args // []) | join(" ")' render.json 2>/dev/null || true); fi
           mkdir -p out
-          npx remotion render "$ENTRY" "$COMP" "out/$P.mp4" --codec=h264 $EXTRA
+          npx remotion render "$ENTRY" "$COMP" "out/part_$IDX.mp4" \
+            --frames=${{ matrix.s }}-${{ matrix.e }} --muted --codec=h264 --pixel-format=yuv420p \
+            $RENDER_DEFAULTS $EXTRA
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: part__${{ matrix.project }}__${{ matrix.idx }}
+          path: work/${{ matrix.project }}/out/part_${{ matrix.idx }}.mp4
+          retention-days: 1
+          compression-level: 0
+
+  # 5. Render audio penuh (paralel dengan render video)
+  audio:
+    needs: [plan, prepare]
+    if: ${{ !cancelled() && needs.plan.outputs.any == 'true' && needs.prepare.result != 'skipped' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        project: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: meta__${{ matrix.project }}
+          path: meta
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ matrix.project }}-${{ hashFiles(format('projects/{0}*', matrix.project), format('projects/{0}/package*.json', matrix.project)) }}
+          restore-keys: |
+            npm-${{ matrix.project }}-
+
+      - name: Siapkan folder project
+        env:
+          P: ${{ matrix.project }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          if [ -f "projects/$P.zip" ]; then
+            mkdir -p work/_tmp
+            unzip -q -o "projects/$P.zip" -d work/_tmp
+            rm -rf work/_tmp/__MACOSX
+            if [ ! -f work/_tmp/package.json ] && [ "$(find work/_tmp -mindepth 1 -maxdepth 1 | wc -l)" -eq 1 ]; then
+              mv work/_tmp/* "work/$P"
+            else
+              mv work/_tmp "work/$P"
+            fi
+            rm -rf work/_tmp
+          else
+            cp -r "projects/$P" "work/$P"
+          fi
+          test -f "work/$P/package.json" || { echo "::error::package.json tidak ditemukan di project $P"; exit 1; }
+
+      - name: Install library sistem untuk Chrome
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libnss3 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 \
+            libasound2t64 libxrandr2 libxkbcommon-x11-0 libxfixes3 libxcomposite1 \
+            libxdamage1 libgbm-dev libcups2 libpango-1.0-0 libcairo2
+
+      - name: Install dependensi dan browser
+        working-directory: work/${{ matrix.project }}
+        run: |
+          if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
+          npx remotion browser ensure
+
+      - name: Render audio
+        working-directory: work/${{ matrix.project }}
+        env:
+          P: ${{ matrix.project }}
+        run: |
+          set -euo pipefail
+          ENTRY=$(jq -r .entry "$GITHUB_WORKSPACE/meta/$P.json")
+          COMP=$(jq -r .comp "$GITHUB_WORKSPACE/meta/$P.json")
+          mkdir -p out
+          npx remotion render "$ENTRY" "$COMP" out/audio.wav --codec=wav --gl=swangle --log=error
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: audio__${{ matrix.project }}
+          path: work/${{ matrix.project }}/out/audio.wav
+          retention-days: 1
+
+  # 6. Gabung potongan + audio jadi satu MP4, lalu publish
+  merge:
+    needs: [plan, expand, render, audio]
+    if: ${{ !cancelled() && needs.plan.outputs.any == 'true' && needs.render.result != 'skipped' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        project: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: meta__${{ matrix.project }}
+          path: meta
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: part__${{ matrix.project }}__*
+          path: parts
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: audio__${{ matrix.project }}
+          path: audio
+
+      - name: Gabung dan mux
+        env:
+          P: ${{ matrix.project }}
+          EXPECTED: ${{ toJson(fromJson(needs.expand.outputs.matrix || '{"include":[]}').include) }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg
+
+          # Pastikan semua potongan ada
+          want=$(echo "$EXPECTED" | jq --arg p "$P" '[.[] | select(.project==$p)] | length')
+          have=$(ls parts/part_*.mp4 2>/dev/null | wc -l)
+          if [ "$want" -ne "$have" ]; then
+            echo "::error::Potongan tidak lengkap untuk $P: butuh $want, ada $have. Cek job render yang gagal."
+            exit 1
+          fi
+
+          mkdir -p out
+          ls parts/part_*.mp4 | sort | sed "s|^|file '$PWD/|; s|$|'|" > list.txt
+          ffmpeg -loglevel error -f concat -safe 0 -i list.txt -c copy video_only.mp4
+          ffmpeg -loglevel error -i video_only.mp4 -i audio/audio.wav \
+            -c:v copy -c:a aac -b:a 192k -shortest -movflags +faststart "out/$P.mp4"
           ls -lh out
 
       - name: Upload sebagai artifact
         uses: actions/upload-artifact@v4
         with:
           name: render-${{ matrix.project }}
-          path: work/${{ matrix.project }}/out/*.mp4
+          path: out/${{ matrix.project }}.mp4
           retention-days: 14
+          compression-level: 0
 
       - name: Publish ke GitHub Release (link download langsung)
         env:
           GH_TOKEN: ${{ github.token }}
           P: ${{ matrix.project }}
-          RUN: ${{ github.run_number }}
+          RUN: ${{ github.run_number }}-${{ github.run_attempt }}
         run: |
-          gh release create "render-$P-$RUN" "work/$P/out/$P.mp4" \
+          gh release create "render-$P-$RUN" "out/$P.mp4" \
+            --repo "$GITHUB_REPOSITORY" \
             --title "Render $P #$RUN" \
             --notes "Hasil render otomatis dari projects/$P (commit ${GITHUB_SHA::7})."
+            
